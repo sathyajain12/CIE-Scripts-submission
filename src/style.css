@@ -1,0 +1,11 @@
+body { font: 14px system-ui, sans-serif; margin: 16px; background: #fafafa; color: #222; }
+.bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+.wrap { overflow: auto; max-height: 80vh; }
+table { border-collapse: collapse; background: #fff; }
+th, td { border: 1px solid #ddd; padding: 6px; vertical-align: top; }
+th { background: #eee; position: sticky; top: 0; z-index: 1; }
+td.st label { display: block; white-space: nowrap; }
+td input[type=text] { width: 170px; }
+tr.dirty { background: #fff8e1; }
+tr.saved { background: #e8f5e9; }
+.err { color: #c62828; }
