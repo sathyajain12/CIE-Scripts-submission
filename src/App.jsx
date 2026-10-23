@@ -1,187 +1,234 @@
+// Campus data-entry page: staff mark each course's script submission status (Y / N / NA) per component.
+// Every change autosaves through the Worker API (worker/index.js), which acts as a Google service account.
 import { useEffect, useRef, useState } from 'react';
-import { colLetter } from './cell.js';
-import logo from '../Image/Header logo.png';
+import Header, { Band, Footer, SignOutLink } from './Header.jsx';
+import { courseState, findCols, semNum, writable, yn } from './sheet.js';
 
-const { VITE_SHEET_ID: SHEET_ID, VITE_SHEET_TAB: TAB = 'Sheet1', VITE_GOOGLE_CLIENT_ID: CLIENT_ID } = import.meta.env;
-const API = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values`;
-const a1 = r => encodeURIComponent(`'${TAB.replace(/'/g, "''")}'!${r}`);
+// TODO(deadline): there is no submission deadline in the sheet or config yet, so none is shown.
+// When the institute fixes one, set it here as 'YYYY-MM-DD' (or serve it from the API) to show
+// "Deadline: <date> · N days left" above the summary. Do not guess a date.
+const DEADLINE = null;
 
-const UNCONFIGURED = !SHEET_ID || !CLIENT_ID;
+// Autosave: changes to one row inside SAVE_DELAY go out as one save; typing saves after TEXT_DELAY of quiet
+// (or on blur). At most MAX_PARALLEL saves run at once, with retries, to stay inside the Sheets API quota.
+const SAVE_DELAY = 700;
+const TEXT_DELAY = 800;
+const MAX_PARALLEL = 3;
+const RETRIES = 2;
 
-// Columns answered with Y / N (Y asks whether it was a hard or soft copy).
-// For "Summative test" a soft copy stores the drive link itself in the cell instead of "Y".
-const YN_COLS = ['CIE Block-1', 'CIE Block-2', 'CIE Block-3', 'Assignments', 'Summative test'];
+// Display names for sheet headers (the sheet itself is not changed).
+const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+const NAMES = {
+  sno: 'S.No.', coursecodecc: 'Course code', coursecode: 'Course code', coursetitle: 'Course title', coursetype: 'Course type',
+  semester: 'Semester', campus: 'Campus', ciemax: 'CIE max', cieblock1: 'Block 1', cieblock2: 'Block 2', cieblock3: 'Block 3',
+  assignments: 'Assignments', remarks: 'Remarks', programmeshortname: 'Programme',
+};
+const label = h => NAMES[norm(h)] || (norm(h).startsWith('summativetest') ? 'Summative (I papers)' : h);
+const MUTED = ['coursetype', 'semester', 'ciemax'];
+const STATUS_FILTERS = { all: 'All courses', incomplete: 'Has empty entries', notStarted: 'Not started', partial: 'Partially done', complete: 'Complete' };
+const LOCKED = ['forwarded', 'submitted'];
 
-async function api(token, path, opts = {}) {
-  const res = await fetch(API + path, {
-    ...opts,
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-  });
-  const j = await res.json();
-  if (!res.ok) throw new Error(res.status === 401 ? 'Session expired, sign in again.' : j.error?.message || res.statusText);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const hhmm = d => d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+// GET /api/rows?campus= reads the campus tab; POST /api/save writes some of one row's cells.
+// The server checks every request against the signed-in user's campuses.
+export async function api(path, body) {
+  let j;
+  try {
+    const res = await fetch('/api/' + path, body
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : undefined);
+    j = await res.json();
+  } catch {
+    throw new Error('Could not reach the portal API. If you are running locally, start it with: npm run dev:api');
+  }
+  if (j.error === 'Please sign in with your Google account.') throw new Error('Your sign-in has expired. Reload the page to sign in again.');
+  if (j.error) throw new Error(j.error);
   return j;
 }
 
-// Match headers loosely so "Course Code (CC)", "Summative test for 1 paper" etc. resolve.
-const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-function findCols(headers) {
-  const find = name => headers.findIndex(h => norm(h).startsWith(norm(name)));
-  const f = name => {
-    const i = find(name);
-    if (i < 0) throw new Error('Column not found in sheet: ' + name);
-    return i;
-  };
-  return {
-    prog: f('Programme'), sem: f('Semester'), code: f('Course Code'),
-    yn: YN_COLS.map(f),
-    link: f('Summative test'), remarks: f('Remarks'),
-    hidden: [find('Swayam'), find('ESE Max')].filter(i => i >= 0), // kept in the sheet, not shown here
-  };
-}
-const writable = cols => [...cols.yn, cols.remarks];
-
-// Y/N cells hold "Y" | "N" | "" (or a drive link in Summative test). Any other text counts as Y.
-const yn = v => (/^n$|^no\b/i.test(v.trim()) ? 'N' : v.trim() ? 'Y' : '');
-
-// % of Y/N cells answered Y across a list of [row, index] pairs.
-function ynPct(list, ynCols) {
-  const total = list.length * ynCols.length;
-  if (!total) return 0;
-  let y = 0;
-  for (const [r] of list) for (const j of ynCols) y += yn(r[j]) === 'Y';
-  return Math.round((y / total) * 100);
-}
-
-function Header() {
-  const ref = useRef();
-  // Table headers stick just below this bar, so publish its height as --header-h.
-  useEffect(() => {
-    const ro = new ResizeObserver(([e]) => document.documentElement.style.setProperty('--header-h', e.target.offsetHeight + 'px'));
-    ro.observe(ref.current);
-    return () => ro.disconnect();
-  }, []);
-  return (
-    <header ref={ref} className="top">
-      <img src={logo} alt="Sri Sathya Sai Institute of Higher Learning — CIE Scripts Submission Portal" />
-    </header>
-  );
-}
-
-export default function App() {
-  const [token, setToken] = useState(null);
+// campus: the sheet tab ('PSN' …); me: { email, campuses, directs, admin } from /api/me.
+// mode 'office' = campus office data entry; 'director' = read-only review with Submit / Return.
+export default function App({ campus, me, mode = 'office' }) {
+  const [wf, setWf] = useState(null); // review workflow: { status, last, history }
+  const [wfLoad, setWfLoad] = useState(0);
+  const [load, setLoad] = useState(0); // bump to reload the sheet
   const [data, setData] = useState(null); // { headers, cols }
-  const [rows, setRows] = useState([]);
-  // How each "Y" was submitted this session: row -> col -> 'hard' | 'soft'. The sheet only stores Y (or the link).
-  const [via, setVia] = useState({});
-  const [state, setState] = useState({}); // row index -> 'dirty' | 'saving' | 'saved'
+  const [rows, setRowsState] = useState([]);
+  // How each "Y" was given this session: row -> col -> 'hard' | 'soft'. The sheet stores "Y" or the drive link.
+  const [via, setViaState] = useState({});
+  // Save state per row: { s: 'pending' | 'saving' | 'saved' | 'link' | 'failed', msg, at }
+  const [saveState, setSaveState] = useState({});
+  const [lastSaved, setLastSaved] = useState(null);
   const [err, setErr] = useState('');
-  const [f, setFilters] = useState({ prog: '', sem: '', q: '', pending: false });
+  const [f, setFilters] = useState({ prog: '', sem: '', q: '', status: 'all' });
+  const [snap, setSnap] = useState(null); // rows matching the status filter when it was chosen
   const [page, setPage] = useState(1);
   const [size, setSize] = useState(25);
-  const setF = v => { setFilters(v); setPage(1); }; // new filters start from page 1
   const [group, setGroup] = useState(true); // group table rows by programme
-  const [collapsed, setCollapsed] = useState({}); // programme -> true when its rows are hidden
+  const [expanded, setExpanded] = useState({}); // programme -> true when opened; every programme starts collapsed
   const tableTop = useRef();
 
-  function signIn() {
-    google.accounts.oauth2.initTokenClient({
-      client_id: CLIENT_ID,
-      scope: 'https://www.googleapis.com/auth/spreadsheets',
-      callback: r => (r.error ? setErr(r.error) : setToken(r.access_token)),
-    }).requestAccessToken();
-  }
+  // Timers and saves read the latest values through refs, not through stale closures.
+  const dataRef = useRef(null), rowsRef = useRef([]), savedRef = useRef([]), viaRef = useRef({}), stateRef = useRef({});
+  const timers = useRef({}), chains = useRef({}), slots = useRef({ n: 0, q: [] });
+  const setRows = next => { rowsRef.current = next; setRowsState(next); };
+  const setVia = next => { viaRef.current = next; setViaState(next); };
+  const setRowState = (i, s, msg) => {
+    const next = { ...stateRef.current };
+    if (s) next[i] = { s, msg, at: Date.now() }; else delete next[i];
+    stateRef.current = next;
+    setSaveState(next);
+  };
 
   useEffect(() => {
-    if (!token) return;
-    api(token, '/' + a1('A1:ZZ'))
-      .then(({ values = [] }) => {
+    setErr('');
+    api('rows?campus=' + encodeURIComponent(campus))
+      .then(({ values = [], user }) => {
         const headers = values[0] || [];
         const cols = findCols(headers);
-        setData({ headers, cols });
-        setRows(values.slice(1).map(r => headers.map((_, j) => r[j] ?? '')));
+        const loaded = values.slice(1).map(r => headers.map((_, j) => r[j] ?? ''));
+        dataRef.current = { headers, cols };
+        savedRef.current = loaded.map(r => [...r]); // what the sheet holds, to work out what changed
+        setData({ headers, cols, user }); // user: the signed-in email
+        setRows(loaded);
         setVia({});
-        setState({});
-        setErr('');
+        stateRef.current = {};
+        setSaveState({});
       })
       .catch(e => setErr(e.message));
-  }, [token]);
+  }, [load, campus]);
 
-  const setCell = (i, j, v) => {
-    setRows(rs => rs.map((r, k) => (k === i ? r.map((x, m) => (m === j ? v : x)) : r)));
-    setState(s => ({ ...s, [i]: 'dirty' }));
-  };
-  const pickYN = (i, j, v, mode) => {
-    setCell(i, j, v);
-    setVia(s => ({ ...s, [i]: { ...s[i], [j]: mode } }));
-  };
+  useEffect(() => {
+    api('workflow?campus=' + encodeURIComponent(campus)).then(setWf).catch(e => setErr(e.message));
+  }, [wfLoad, campus]);
 
-  async function save(i) {
-    const { headers, cols } = data, r = rows[i], n = i + 2;
-    if (via[i]?.[cols.link] === 'soft' && !r[cols.link].trim()) return alert(`${headers[cols.link]}: enter the drive link for the soft copy.`);
-    setState(s => ({ ...s, [i]: 'saving' }));
-    try {
-      // Guard: someone may have sorted/edited the sheet since we loaded it.
-      const cur = await api(token, '/' + a1(colLetter(cols.code) + n));
-      if ((cur.values?.[0]?.[0] ?? '') !== r[cols.code]) throw new Error('Sheet changed since you loaded it. Reload the page.');
-      await api(token, ':batchUpdate', {
-        method: 'POST',
-        body: JSON.stringify({
-          valueInputOption: 'RAW', // RAW = stored as plain text, never evaluated as a formula
-          data: writable(cols).map(j => ({ range: `'${TAB.replace(/'/g, "''")}'!${colLetter(j)}${n}`, values: [[r[j].trim()]] })),
-        }),
-      });
-      setState(s => ({ ...s, [i]: 'saved' }));
-    } catch (e) {
-      setState(s => ({ ...s, [i]: 'dirty' }));
-      alert(e.message);
+  // Warn before leaving while anything is unsaved, saving, failed or waiting for a drive link.
+  useEffect(() => {
+    const onLeave = e => {
+      if (Object.keys(timers.current).length || Object.values(stateRef.current).some(x => x.s !== 'saved')) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    addEventListener('beforeunload', onLeave);
+    return () => removeEventListener('beforeunload', onLeave);
+  }, []);
+
+  // ---- Autosave -------------------------------------------------------------------------------------------
+  const needsLink = (i, j) => viaRef.current[i]?.[j] === 'soft' && !String(rowsRef.current[i][j]).trim();
+  const changed = i => writable(dataRef.current.cols).filter(j => String(rowsRef.current[i][j]).trim() !== String(savedRef.current[i][j]).trim());
+
+  function schedule(i, delay = SAVE_DELAY) {
+    clearTimeout(timers.current[i]);
+    if (stateRef.current[i]?.s !== 'saving') setRowState(i, 'pending');
+    timers.current[i] = setTimeout(() => flush(i), delay);
+  }
+
+  // Saves for one row run one after another, so a later change is never overwritten by an earlier one.
+  function flush(i) {
+    clearTimeout(timers.current[i]);
+    delete timers.current[i];
+    chains.current[i] = (chains.current[i] || Promise.resolve()).then(() => send(i));
+  }
+
+  function slot(fn) {
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        slots.current.n++;
+        fn().then(resolve, reject).finally(() => { slots.current.n--; slots.current.q.shift()?.(); });
+      };
+      if (slots.current.n < MAX_PARALLEL) run(); else slots.current.q.push(run);
+    });
+  }
+
+  async function send(i) {
+    const { cols } = dataRef.current;
+    const r = rowsRef.current[i];
+    const cells = changed(i).filter(j => !needsLink(i, j)).map(j => ({ col: j, value: String(r[j]).trim() }));
+    if (!cells.length) return finish(i, false);
+    setRowState(i, 'saving');
+    for (let attempt = 0; ; attempt++) {
+      try {
+        // The API refuses the write if this row's course code no longer matches (sheet sorted or edited).
+        await slot(() => api('save', { campus, row: i + 2, code: r[cols.code], cells }));
+        break;
+      } catch (e) {
+        if (attempt < RETRIES && !/Sheet changed|Bad request|cannot be edited/i.test(e.message)) { await sleep(1500 * (attempt + 1) ** 2); continue; }
+        setRowState(i, 'failed', e.message); // the user's entry stays on screen; Retry sends it again
+        return;
+      }
+    }
+    for (const c of cells) savedRef.current[i][c.col] = c.value;
+    setLastSaved(new Date());
+    finish(i, true);
+  }
+
+  function finish(i, didSave) {
+    if (timers.current[i]) return; // more edits are already waiting
+    if (changed(i).some(j => !needsLink(i, j))) return flush(i); // edited again while this save was running
+    if (dataRef.current.cols.yn.some(j => needsLink(i, j))) return setRowState(i, 'link');
+    setRowState(i, didSave || stateRef.current[i]?.s === 'saved' ? 'saved' : null);
+  }
+
+  // ---- Editing ---------------------------------------------------------------------------------------------
+  const setCell = (i, j, v) => setRows(rowsRef.current.map((r, k) => (k === i ? r.map((x, m) => (m === j ? v : x)) : r)));
+  const setMode = (i, j, mode) => setVia({ ...viaRef.current, [i]: { ...viaRef.current[i], [j]: mode } });
+  const pick = (i, j, v, mode) => { setCell(i, j, v); setMode(i, j, mode); schedule(i); };
+  const typed = (i, j, v) => { setCell(i, j, v); schedule(i, TEXT_DELAY); };
+  const typedDone = i => { if (timers.current[i]) flush(i); };
+  const retryAll = () => Object.entries(stateRef.current).filter(([, x]) => x.s === 'failed').forEach(([i]) => flush(+i));
+
+  // "Mark all…" in a programme header: fills empty cells (or all, with overwrite) and autosaves each row.
+  function markAll(g, j, v, overwrite) {
+    for (const [r, i] of g.rows) {
+      if (!overwrite && yn(r[j])) continue;
+      setCell(i, j, v);
+      setMode(i, j, v === 'Y' ? 'hard' : undefined);
+      schedule(i, 300);
     }
   }
 
-  if (!token) return (
-    <>
-      <Header />
-      <main className="center">
-        <div className="card login">
-          <h1>Welcome</h1>
-          <p>Track CIE script and assignment submissions for every course, synced live with the department sheet.</p>
-          {UNCONFIGURED ? <p className="err">Portal is not configured: set VITE_SHEET_ID and VITE_GOOGLE_CLIENT_ID in .env and restart the server.</p> : (
-          <button className="gbtn" onClick={signIn}>
-            <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-7.9l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>
-            Sign in with Google
-          </button>
-          )}
-          {err && <p className="err">{err}</p>}
-        </div>
-      </main>
-    </>
-  );
   if (!data) return (
-    <>
+    <div className="entry">
       <Header />
-      <main className="center">
-        {err ? <p className="err">{err} <button className="btn" onClick={signIn}>Sign in again</button></p> : <div className="spinner" aria-label="Loading" />}
+      <main className="entry-main admin-state">
+        {err ? (
+          <div className="state-box" role="alert">
+            <p>{err}</p>
+            <button className="btn-secondary" onClick={() => setLoad(n => n + 1)}>Try again</button>
+          </div>
+        ) : <p className="muted" aria-live="polite">Loading courses…</p>}
       </main>
-    </>
+    </div>
   );
 
   const { headers, cols } = data;
-  const shown = headers.map((_, j) => j).filter(j => !cols.hidden.includes(j));
+  const find = name => headers.findIndex(h => norm(h) === norm(name));
+  const snoCol = headers.findIndex(h => norm(h).startsWith('sno'));
+  const campusCol = find('Campus');
+  const singleCampus = campusCol < 0 || new Set(rows.map(r => r[campusCol]).filter(Boolean)).size <= 1;
   const options = col => [...new Set(rows.map(r => r[col]))].filter(Boolean).sort();
   const q = f.q.toLowerCase();
   const indexed = rows.map((r, i) => [r, i]);
 
-  // Dashboard numbers follow the programme/semester filters, not the search box.
+  // Summary numbers follow the programme/semester filters, not the search box.
   const scoped = indexed.filter(([r]) => (!f.prog || r[cols.prog] === f.prog) && (!f.sem || r[cols.sem] === f.sem));
   const ynStats = cols.yn.map(j => {
-    let y = 0, no = 0;
-    for (const [r] of scoped) { const a = yn(r[j]); y += a === 'Y'; no += a === 'N'; }
-    return { j, y, no, open: scoped.length - y - no };
+    let y = 0, no = 0, na = 0;
+    for (const [r] of scoped) { const a = yn(r[j]); y += a === 'Y'; no += a === 'N'; na += a === 'NA'; }
+    return { j, y, no, na, open: scoped.length - y - no - na };
   });
-  const totalCells = scoped.length * cols.yn.length;
-  const pct = totalCells ? Math.round((ynStats.reduce((a, s) => a + s.y, 0) / totalCells) * 100) : 0;
-  const notStarted = r => !cols.yn.some(j => yn(r[j]) === 'Y');
-  const notStartedCount = scoped.filter(([r]) => notStarted(r)).length;
+  const complete = scoped.filter(([r]) => courseState(r, cols.yn) === 'complete').length;
 
+  // The status filter keeps the rows it matched when chosen, so a row doesn't vanish mid-entry.
+  const setF = v => {
+    setFilters(v);
+    setPage(1);
+    const match = v.status === 'incomplete' ? r => cols.yn.some(j => !String(r[j]).trim()) : r => courseState(r, cols.yn) === v.status;
+    setSnap(v.status === 'all' ? null : new Set(indexed.filter(([r]) => match(r)).map(([, i]) => i)));
+  };
   const byProg = list => {
     const m = new Map();
     for (const it of list) {
@@ -192,154 +239,240 @@ export default function App() {
     return [...m].sort(([a], [b]) => !a - !b || a.localeCompare(b)); // A–Z, rows without a programme last
   };
 
-  const visible = scoped.filter(([r]) => (!q || r.join(' ').toLowerCase().includes(q)) && (!f.pending || notStarted(r)));
+  const visible = scoped.filter(([r, i]) => (!q || r.join(' ').toLowerCase().includes(q)) && (!snap || snap.has(i)));
   const groups = group
-    ? byProg(visible).map(([key, list]) => ({ key, rows: list, collapsed: !!collapsed[key], pct: ynPct(list, cols.yn) }))
+    ? byProg(visible).map(([key, list]) => ({ key, rows: list, collapsed: !expanded[key], complete: list.filter(([r]) => courseState(r, cols.yn) === 'complete').length }))
     : [{ key: '', rows: visible, flat: true }];
   const allPages = paginate(groups, size);
   const pages = allPages.length;
   const cur = Math.min(page, pages);
   const pageItems = allPages[cur - 1];
-  const tableCols = shown.filter(j => !(group && j === cols.prog)); // the group header already names the programme
-  const toggleGroup = k => setCollapsed(c => ({ ...c, [k]: !c[k] }));
+  // S.No. and Course code first (both stay pinned when the table scrolls sideways), then the sheet's columns.
+  const restCols = headers.map((_, j) => j).filter(j => !cols.hidden.includes(j) && j !== snoCol && j !== cols.code
+    && !(group && j === cols.prog) && !(singleCampus && j === campusCol));
+  const span = restCols.length + 3;
+  const toggleGroup = k => setExpanded(e => ({ ...e, [k]: !e[k] }));
   const allCollapsed = group && groups.length > 0 && groups.every(g => g.collapsed);
-  const collapseAll = on => { setCollapsed(on ? Object.fromEntries(groups.map(g => [g.key, true])) : {}); setPage(1); };
+  const collapseAll = on => { setExpanded(on ? {} : Object.fromEntries(groups.map(g => [g.key, true]))); setPage(1); };
   const goTo = p => {
     setPage(p);
     // Bring the top of the table back into view, below the sticky logo bar.
     const y = tableTop.current.getBoundingClientRect().top + scrollY - (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--header-h')) || 0) - 12;
     if (scrollY > y) scrollTo({ top: y, behavior: 'smooth' });
   };
-  const bar = n => ({ width: (scoped.length ? (n / scoped.length) * 100 : 0) + '%' });
+  const failed = Object.values(saveState).filter(x => x.s === 'failed').length;
+  const deadline = DEADLINE ? new Date(DEADLINE + 'T23:59:59+05:30') : null;
+  const daysLeft = deadline ? Math.ceil((deadline - Date.now()) / 86400000) : 0;
+  const canSwitch = (me?.campuses.length || 0) + (me?.directs?.length || 0) + (me?.admin ? 1 : 0) > 1;
+  // A component counts as filled once it has Y / N / NA (or a soft copy is chosen and its link is pending).
+  const filled = (r, i) => cols.yn.filter(j => yn(r[j]) || via[i]?.[j] === 'soft').length;
+  const pctOf = (n, total) => (total ? (n / total) * 100 : 0) + '%';
+  let navRow = 0; // keyboard grid position of each rendered course row
+
+  // Review workflow: entries can only be edited by the campus office while not forwarded / submitted.
+  const locked = LOCKED.includes(wf?.status);
+  const readOnly = mode !== 'office' || !wf || locked;
+  // Every Y/N/NA cell of every course must be filled before forwarding (a soft copy needs its link).
+  const emptyCount = rows.reduce((n, r) => (String(r[cols.code] ?? '').trim() ? n + cols.yn.filter(j => !String(r[j]).trim()).length : n), 0);
+  const allSaved = !Object.keys(timers.current).length && Object.values(saveState).every(x => x.s === 'saved');
+  const showIncomplete = () => { setF({ ...f, status: 'incomplete' }); setExpanded(Object.fromEntries(byProg(indexed).map(([k]) => [k, true]))); };
+  const afterAction = () => setWfLoad(n => n + 1);
 
   return (
-    <>
+    <div className="entry">
       <Header />
-      <main>
-        <section className="stats">
-          <div className="card hero">
-            <Ring pct={pct} />
-            <div>
-              <div className="eyebrow">Overall progress</div>
-              <div className="big">{pct}%</div>
-              <div className="muted">of scripts submitted across {scoped.length} course{scoped.length === 1 ? '' : 's'}</div>
+      <Band
+        title={mode === 'director' ? 'Director review' : 'CIE script submissions'}
+        sub={<>
+          {campus} campus
+          {' · '}
+          {data.user && <>Signed in as {data.user}{mode === 'office' ? ' · ' : ''}</>}
+          {mode === 'office' && (lastSaved ? <>Last saved <span className="tnum">{hhmm(lastSaved)}</span></> : 'Nothing saved yet this session')}
+        </>}
+        aside={<>
+          {deadline && (
+            <div className={'deadline' + (daysLeft < 0 ? ' closed' : daysLeft <= 3 ? ' soon' : '')}>
+              <span className="band-sub">Deadline</span> <b>{deadline.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</b>
+              <span aria-hidden="true"> · </span>
+              <span className="days tnum">{daysLeft < 0 ? 'Closed' : `${daysLeft} day${daysLeft === 1 ? '' : 's'} left`}</span>
+            </div>
+          )}
+          {canSwitch && <a className="band-link" href="/">Switch portal</a>}
+          <SignOutLink />
+        </>}
+      />
+      <main className="entry-main">
+
+        <section className="summary-card" aria-label="Submission summary">
+          {ynStats.map(s => {
+            const total = scoped.length;
+            return (
+              <div key={s.j} className="sum-cell">
+                <div className="sum-head">{label(headers[s.j])}</div>
+                <div className="sum-num"><b className="tnum">{s.y}</b><span className="tnum"> / {total}</span> submitted</div>
+                <div className="sbar" role="img" aria-label={`Yes ${s.y}, No ${s.no}, Not applicable ${s.na}, Open ${s.open}`}>
+                  <span className="seg-y" style={{ width: pctOf(s.y, total) }} />
+                  <span className="seg-n" style={{ width: pctOf(s.no, total) }} />
+                  <span className="seg-na" style={{ width: pctOf(s.na, total) }} />
+                </div>
+                <div className="sum-legend tnum">
+                  <span><i className="sq y" />Y {s.y}</span> · <span><i className="sq n" />N {s.no}</span> · <span><i className="sq na" />NA {s.na}</span> · <span className="muted"><i className="sq open" />Open {s.open}</span>
+                </div>
+              </div>
+            );
+          })}
+          <div className="sum-cell">
+            <div className="sum-head">Fully submitted</div>
+            <div className="sum-num"><b className="tnum">{complete}</b><span className="tnum"> / {scoped.length}</span> courses</div>
+            <div className="sbar" role="img" aria-label={`${complete} of ${scoped.length} courses fully submitted`}>
+              <span className="seg-done" style={{ width: pctOf(complete, scoped.length) }} />
+            </div>
+            <div className="sum-legend tnum">
+              <span><i className="sq done" />Complete {complete}</span> · <span className="muted"><i className="sq open" />Remaining {scoped.length - complete}</span>
             </div>
           </div>
-          {ynStats.map(s => (
-            <div key={s.j} className="card stat">
-              <div className="eyebrow">{headers[s.j]}</div>
-              <div className="num">{s.y}<span>/{scoped.length}</span></div>
-              <div className="bar-track"><div className="bar-fill" style={bar(s.y)} /></div>
-              <div className="split"><span className="kv"><span className="dot yes" />{s.y} yes</span><span className="kv"><span className="dot no" />{s.no} no</span><span className="kv"><span className="dot open" />{s.open} open</span></div>
-            </div>
-          ))}
-          <button className={'card stat pending' + (f.pending ? ' on' : '')} onClick={() => setF({ ...f, pending: !f.pending })}>
-            <div className="eyebrow">Not started</div>
-            <div className="num">{notStartedCount}</div>
-            <div className="muted">{f.pending ? 'Showing only these · click to clear' : 'Click to show only these'}</div>
-          </button>
         </section>
 
+        {wf && (
+          <WorkflowBar
+            campus={campus} mode={mode} wf={wf} emptyCount={emptyCount} allSaved={allSaved}
+            courses={rows.filter(r => String(r[cols.code] ?? '').trim()).length}
+            onShowIncomplete={showIncomplete} onDone={afterAction}
+          />
+        )}
 
-        <div className="toolbar">
-          <select value={f.prog} onChange={e => setF({ ...f, prog: e.target.value })}>
+        <div className="filters toolbar-card">
+          <select aria-label="Programme" className={f.prog ? 'active' : undefined} value={f.prog} onChange={e => setF({ ...f, prog: e.target.value })}>
             <option value="">All programmes</option>
             {options(cols.prog).map(v => <option key={v}>{v}</option>)}
           </select>
-          <select value={f.sem} onChange={e => setF({ ...f, sem: e.target.value })}>
+          <select aria-label="Semester" className={f.sem ? 'active' : undefined} value={f.sem} onChange={e => setF({ ...f, sem: e.target.value })}>
             <option value="">All semesters</option>
-            {options(cols.sem).map(v => <option key={v} value={v}>Semester {v}</option>)}
+            {options(cols.sem).map(v => <option key={v} value={v}>Semester {semNum(v)}</option>)}
           </select>
-          <label className="search">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
-            <input placeholder="Search course code / title" value={f.q} onChange={e => setF({ ...f, q: e.target.value })} />
-          </label>
-          <span className="count">{visible.length} course{visible.length === 1 ? '' : 's'}</span>
-          <span className="spacer" />
+          <select aria-label="Status" className={f.status !== 'all' ? 'active' : undefined} value={f.status} onChange={e => setF({ ...f, status: e.target.value })}>
+            {Object.entries(STATUS_FILTERS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+          <input className={'search' + (f.q ? ' active' : '')} type="search" aria-label="Search course code or title" placeholder="Search course code or title" value={f.q} onChange={e => setF({ ...f, q: e.target.value })} />
+          <span className="muted showing">Showing <span className="tnum">{visible.length}</span> of <span className="tnum">{rows.length}</span> courses</span>
+          <span className="grow" />
           {group && groups.length > 0 && (
-            <button className="btn" onClick={() => collapseAll(!allCollapsed)}>{allCollapsed ? 'Expand all' : 'Collapse all'}</button>
+            <button className="btn-secondary btn-sm" onClick={() => collapseAll(!allCollapsed)}>{allCollapsed ? 'Expand all' : 'Collapse all'}</button>
           )}
-          <label className="switch">
+          <label className="check">
             <input type="checkbox" checked={group} onChange={e => { setGroup(e.target.checked); setPage(1); }} />
-            <span className="track" aria-hidden="true" />
             Group by programme
           </label>
-          {err && <span className="err">{err}</span>}
         </div>
 
-        <div className="wrap" ref={tableTop}>
-          <table>
-            <thead><tr>{tableCols.map(j => <th key={j}>{headers[j]}</th>)}<th /></tr></thead>
+        {failed > 0 && (
+          <div className="banner-fail" role="alert">
+            <span>{failed} row{failed === 1 ? '' : 's'} could not be saved. Your entries are still on screen.</span>
+            <button className="btn-secondary btn-sm" onClick={retryAll}>Retry all</button>
+          </div>
+        )}
+        {!readOnly && <p className="tip">Tip: use <kbd>Y</kbd> / <kbd>N</kbd> / <kbd>A</kbd> keys and arrows to enter quickly. <kbd>S</kbd> marks a soft copy, <kbd>Backspace</kbd> clears.</p>}
+        {readOnly && <p className="tip">{mode === 'director' ? 'Read-only view of the campus entries.' : 'Entries are locked while the review is in progress.'}</p>}
+
+        <div className="grid-wrap" ref={tableTop}>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th scope="col" className="stick c1 n">S.No.</th>
+                <th scope="col" className="stick c2">Course code</th>
+                {restCols.map(j => <th key={j} scope="col" className={cols.yn.includes(j) ? 'st' + (cols.yn.indexOf(j) % 2 === 0 ? ' ct' : '') : undefined}>{label(headers[j])}</th>)}
+                <th scope="col"><span className="sr-only">Save status</span></th>
+              </tr>
+            </thead>
             <tbody>
               {pageItems.items.map(item => {
                 if (item.head) {
                   const g = item.head;
                   return (
                     <tr key={'g:' + g.key + (item.cont ? ':cont' : '')} className="group-row">
-                      <td colSpan={tableCols.length + 1}>
-                        <button className="group-btn" onClick={() => toggleGroup(g.key)} aria-expanded={!g.collapsed}>
-                          <svg className={'chev' + (g.collapsed ? '' : ' open')} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
-                          <span className="group-name">{g.key || '(No programme)'}</span>
-                          {item.cont && <span className="muted">(continued)</span>}
-                          <span className="group-meta">{g.rows.length} course{g.rows.length === 1 ? '' : 's'}</span>
-                          <span className="group-bar"><span style={{ width: g.pct + '%' }} /></span>
-                          <span className="group-pct">{g.pct}%</span>
-                        </button>
+                      <td colSpan={span}>
+                        <div className="gh">
+                          <button className="gh-toggle" onClick={() => toggleGroup(g.key)} aria-expanded={!g.collapsed}>
+                            <svg className={'chev' + (g.collapsed ? '' : ' open')} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+                            <span className="gh-name">{g.key || '(No programme)'}</span>
+                            {item.cont && <span className="muted">(continued)</span>}
+                          </button>
+                          <span className="muted tnum">{g.rows.length} course{g.rows.length === 1 ? '' : 's'}</span>
+                          <span className="gbar" aria-hidden="true"><span style={{ width: pctOf(g.complete, g.rows.length) }} /></span>
+                          <span className="muted tnum">{g.complete} complete</span>
+                          {!item.cont && !readOnly && <MarkAll g={g} cols={cols} headers={headers} onApply={markAll} />}
+                        </div>
                       </td>
                     </tr>
                   );
                 }
                 const [r, i] = item.row;
+                const nr = navRow++;
+                let nc = 0;
+                // Row state at a glance: untouched, partly filled (amber edge) or all components set (green edge).
+                const done = filled(r, i);
+                const rowCls = [item.n % 2 === 0 && 'alt', done === cols.yn.length ? 'rs-full' : done > 0 && 'rs-partial'].filter(Boolean).join(' ');
                 return (
-                  <tr key={i} className={state[i] === 'saving' ? 'dirty' : state[i]}>
-                    {tableCols.map(j => {
+                  <tr key={i} className={rowCls || undefined}>
+                    <td className="stick c1 n muted" title={snoCol >= 0 ? `Sheet S.No. ${r[snoCol]}` : undefined}>{item.n}</td>
+                    <td className="stick c2 mono code">{r[cols.code]}</td>
+                    {restCols.map(j => {
                       const v = r[j];
-                      if (cols.yn.includes(j)) return (
-                        <YesNo
-                          key={j} label={headers[j]} v={v} via={via[i]?.[j]} linkOnSoft={j === cols.link}
-                          onPick={(v, mode) => pickYN(i, j, v, mode)} onLink={v => setCell(i, j, v)}
-                        />
-                      );
-                      if (j === cols.remarks) return <td key={j} className="text"><input className="txt" type="text" placeholder="Remarks (optional)" value={v} onChange={e => setCell(i, j, e.target.value)} /></td>;
-                      if (j === cols.code) return <td key={j}><span className="code">{v}</span></td>;
-                      return <td key={j}>{v}</td>;
+                      if (cols.yn.includes(j)) {
+                        const c = nc++;
+                        return (
+                          <td key={j} className={'st' + (c % 2 === 0 ? ' ct' : '')}>
+                            <StatusCell
+                              name={label(headers[j])} v={v} via={via[i]?.[j]} nav={[nr, c]} readOnly={readOnly}
+                              onPick={(val, mode) => pick(i, j, val, mode)} onLink={val => typed(i, j, val)} onLinkDone={() => typedDone(i)}
+                            />
+                          </td>
+                        );
+                      }
+                      if (j === cols.remarks) {
+                        return (
+                          <td key={j}>
+                            <input className="rem" type="text" aria-label={`Remarks for ${r[cols.code]}`} placeholder={readOnly ? '' : 'Remarks'} value={v} readOnly={readOnly}
+                              onChange={e => typed(i, j, e.target.value)} onBlur={() => typedDone(i)} />
+                          </td>
+                        );
+                      }
+                      if (j === cols.sem) return <td key={j} className="dim tnum" title={v}>{semNum(v)}</td>;
+                      if (j === cols.title) return <td key={j} className="ctitle">{v}</td>;
+                      return <td key={j} className={MUTED.includes(norm(headers[j])) ? 'dim' : undefined}>{v}</td>;
                     })}
-                    <td>
-                      <button className={'btn' + (state[i] === 'saved' ? ' ok' : state[i] ? ' primary' : '')} disabled={state[i] === 'saving'} onClick={() => save(i)}>
-                        {state[i] === 'saving' ? 'Saving…' : state[i] === 'saved' ? 'Saved' : 'Save'}
-                      </button>
-                    </td>
+                    <td className="ss-cell"><SaveState st={saveState[i]} onRetry={() => flush(i)} /></td>
                   </tr>
                 );
               })}
-              {!visible.length && <tr><td className="empty" colSpan={tableCols.length + 1}>No courses match these filters.</td></tr>}
+              {!visible.length && <tr><td className="empty" colSpan={span}>No courses match these filters.</td></tr>}
             </tbody>
           </table>
         </div>
         {visible.length > 0 && (
-          <Pager
-            page={cur} pages={pages} from={pageItems.from} to={pageItems.to} size={size} total={visible.length}
-            onPage={goTo} onSize={s => { setSize(s); setPage(1); }}
-          />
+          <nav className="pages-bar" aria-label="Pages">
+            <span className="muted">{pageItems.to >= pageItems.from ? <>Rows <span className="tnum">{pageItems.from}–{pageItems.to}</span> of <span className="tnum">{visible.length}</span></> : <><span className="tnum">{visible.length}</span> courses</>}</span>
+            <span className="grow" />
+            <button className="btn-secondary" disabled={cur === 1} onClick={() => goTo(cur - 1)}>Previous</button>
+            <span className="muted">Page <span className="tnum">{cur}</span> of <span className="tnum">{pages}</span></span>
+            <button className="btn-secondary" disabled={cur === pages} onClick={() => goTo(cur + 1)}>Next</button>
+            <label className="muted per">
+              Rows per page
+              <select value={size} onChange={e => { setSize(+e.target.value); setPage(1); }}>
+                {[10, 25, 50, 100].map(n => <option key={n}>{n}</option>)}
+              </select>
+            </label>
+          </nav>
         )}
       </main>
-    </>
+      <Footer />
+    </div>
   );
 }
 
-// 1 … 4 5 [6] 7 8 … 20
-function pageList(page, pages) {
-  const keep = new Set([1, pages, page - 2, page - 1, page, page + 1, page + 2]);
-  const out = [];
-  for (let p = 1; p <= pages; p++) {
-    if (keep.has(p)) out.push(p);
-    else if (out[out.length - 1] !== '…') out.push('…');
-  }
-  return out;
-}
-
-// Split groups into pages of `size` course rows. Group headers don't count towards the size; a group that
-// runs onto the next page gets its header repeated there as "(continued)". Collapsed groups show only their header.
+// Split groups into pages of `size` course rows, numbering the rows 1, 2, 3… in display order. Group headers
+// don't count towards the size; a group that runs onto the next page gets its header repeated as "(continued)".
+// Collapsed groups show only their header.
 function paginate(groups, size) {
   const pages = [];
   let page, n = 0, seen = 0;
@@ -356,43 +489,12 @@ function paginate(groups, size) {
         open();
         if (!g.flat) page.items.push({ head: g, cont: true });
       }
-      page.items.push({ row });
-      n++; seen++; page.to = seen;
+      seen++;
+      page.items.push({ row, n: seen });
+      n++; page.to = seen;
     }
   }
   return pages;
-}
-
-function Pager({ page, pages, from, to, size, total, onPage, onSize }) {
-  return (
-    <nav className="pager" aria-label="Pagination">
-      <span className="muted">{to >= from ? <>Showing <b>{from}–{to}</b> of <b>{total}</b></> : <><b>{total}</b> courses</>}</span>
-      <div className="pages">
-        <button className="pg" disabled={page === 1} onClick={() => onPage(page - 1)} >Previous</button>
-        {pageList(page, pages).map((p, k) =>
-          p === '…' ? <span key={'e' + k} className="pg-gap">…</span>
-          : <button key={p} className={'pg' + (p === page ? ' on' : '')} aria-current={p === page ? 'page' : undefined} onClick={() => onPage(p)}>{p}</button>
-        )}
-        <button className="pg" disabled={page === pages} onClick={() => onPage(page + 1)} >Next</button>
-      </div>
-      <label className="muted per">
-        Rows per page
-        <select value={size} onChange={e => onSize(+e.target.value)}>
-          {[10, 25, 50, 100].map(n => <option key={n}>{n}</option>)}
-        </select>
-      </label>
-    </nav>
-  );
-}
-
-function Ring({ pct }) {
-  const r = 34, c = 2 * Math.PI * r;
-  return (
-    <svg className="ring" width="88" height="88" viewBox="0 0 88 88" aria-hidden="true">
-      <circle cx="44" cy="44" r={r} className="ring-bg" />
-      <circle cx="44" cy="44" r={r} className="ring-fg" strokeDasharray={c} strokeDashoffset={c * (1 - pct / 100)} />
-    </svg>
-  );
 }
 
 // Popover anchored to a button; closes on outside click, Esc or scroll.
@@ -420,53 +522,224 @@ function usePop() {
     const b = anchor.current.getBoundingClientRect();
     const left = Math.max(8, Math.min(b.left, innerWidth - 288));
     // Flip above the anchor when there isn't room below.
-    setPos(b.bottom + 220 > innerHeight ? { left, bottom: innerHeight - b.top + 6 } : { left, top: b.bottom + 6 });
+    setPos(b.bottom + 240 > innerHeight ? { left, bottom: innerHeight - b.top + 6 } : { left, top: b.bottom + 6 });
   }
 
   return { pos, anchor, pop, toggle, close: () => setPos(null) };
 }
 
-// Y / N cell. With linkOnSoft, choosing a soft copy turns the cell into a text field for the drive link,
-// and the link (not "Y") is what gets saved. A cell loaded with any text other than Y/N is treated as that link.
-function YesNo({ label, v, via, linkOnSoft, onPick, onLink }) {
+const ARROWS = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+
+// Y / N / NA for one component of one course: a radio group that is one Tab stop and takes keys.
+// Y is either a hard copy (stored "Y") or a soft copy (stored as the drive link, typed into the cell).
+// readOnly: shows the value but ignores clicks and keys (arrow keys still move between cells).
+function StatusCell({ name, v, via, nav, readOnly, onPick, onLink, onLinkDone }) {
   const a = yn(v);
-  const linkMode = linkOnSoft && (via === 'soft' || (a === 'Y' && !/^y$/i.test(v.trim())));
-  const mode = via || (linkMode ? 'soft' : undefined);
-  const yes = a === 'Y' || linkMode;
+  const linkMode = via === 'soft' || (a === 'Y' && !/^y$/i.test(v.trim()));
+  const sel = a === 'Y' || linkMode ? 'Y' : a; // 'Y' | 'N' | 'NA' | ''
+  const mode = via || (linkMode ? 'soft' : sel === 'Y' ? 'hard' : undefined);
   const url = linkMode && v.match(/https?:\/\/\S+/)?.[0];
   const p = usePop();
-  const pick = (val, mode) => { onPick(val, mode); p.close(); };
+  const groupRef = useRef();
+  const choose = (val, m) => { onPick(val, m); p.close(); groupRef.current?.focus(); };
+
+  function onKey(e) {
+    if (e.altKey || e.ctrlKey || e.metaKey || e.target !== groupRef.current) return;
+    const k = e.key.toLowerCase();
+    if (readOnly && !ARROWS[e.key]) return;
+    if (k === 'y') choose('Y', 'hard');
+    else if (k === 's') choose(linkMode ? v : '', 'soft');
+    else if (k === 'n') choose('N');
+    else if (k === 'a') choose('NA');
+    else if (k === 'backspace' || k === 'delete') choose('');
+    else if (ARROWS[e.key]) {
+      const [dr, dc] = ARROWS[e.key];
+      document.querySelector(`[data-nav="${nav[0] + dr}-${nav[1] + dc}"]`)?.focus();
+    } else return;
+    e.preventDefault();
+  }
+
+  const radio = (key, text, word, onClick, ref) => (
+    <button ref={ref} type="button" role="radio" tabIndex={-1} className={'opt-' + key.toLowerCase()} aria-checked={sel === key} aria-label={`${name}: ${word}`} aria-disabled={readOnly || undefined} onClick={readOnly ? undefined : onClick}>{text}</button>
+  );
 
   return (
-    <td className="yn">
-      <div className="yn-btns">
-        <button ref={p.anchor} className={'yn-y' + (yes ? ' on' : '')} onClick={p.toggle} title="Yes — submitted">Y</button>
-        <button className={'yn-n' + (a === 'N' ? ' on' : '')} onClick={() => pick(a === 'N' ? '' : 'N')} title="No — not submitted">N</button>
+    <>
+      <div ref={groupRef} className={'yn3' + (readOnly ? ' ro' : '')} role="radiogroup" aria-label={name} aria-readonly={readOnly || undefined} tabIndex={0} data-nav={`${nav[0]}-${nav[1]}`} data-empty={!sel} onKeyDown={onKey}>
+        {radio('Y', 'Y', mode === 'soft' ? 'Yes, soft copy' : 'Yes', p.toggle, p.anchor)}
+        {radio('N', 'N', 'No', () => choose(sel === 'N' ? '' : 'N'))}
+        {radio('NA', 'NA', 'Not applicable', () => choose(sel === 'NA' ? '' : 'NA'))}
       </div>
-      {linkMode ? (
-        <>
+      {linkMode && (
+        <div className="link-row">
           <input
             autoFocus={via === 'soft' && !v}
-            className={'txt link' + (v.trim() ? '' : ' need')}
+            className={'link-in' + (v.trim() ? '' : ' need')}
             type="text"
+            aria-label={`${name}: drive link for the soft copy`}
             placeholder="Paste drive link"
             value={v}
+            readOnly={readOnly}
             onChange={e => onLink(e.target.value)}
+            onBlur={onLinkDone}
           />
-          {url && <a className="open" href={url} target="_blank" rel="noreferrer">Open link</a>}
-        </>
-      ) : yes && via && <span className={'via ' + via}>{via === 'hard' ? 'Hard copy' : 'Soft copy'}</span>}
-      {p.pos && (
-        <div ref={p.pop} className="pop" style={p.pos}>
-          <div className="pop-title">{label}: how was it submitted?</div>
-          <div className="seg">
-            <button className={mode === 'hard' ? 'on' : ''} onClick={() => pick('Y', 'hard')}>Hard copy</button>
-            <button className={mode === 'soft' ? 'on' : ''} onClick={() => pick(linkMode ? v : linkOnSoft ? '' : 'Y', 'soft')}>Soft copy</button>
-          </div>
-          {linkOnSoft && <p className="hint">Soft copy: paste the drive link in this cell.</p>}
-          {(a || linkMode) && <div className="pop-foot"><button className="link-btn" onClick={() => pick('')}>Clear</button></div>}
+          {url && <a className="open-link" href={url} target="_blank" rel="noreferrer">Open</a>}
         </div>
       )}
-    </td>
+      {p.pos && (
+        <div ref={p.pop} className="pop" style={p.pos} role="dialog" aria-label={`${name}: how was it submitted?`}>
+          <div className="pop-title">{name}: how was it submitted?</div>
+          <div className="seg">
+            <button className={mode === 'hard' ? 'on' : ''} onClick={() => choose('Y', 'hard')}>Hard copy</button>
+            <button className={mode === 'soft' ? 'on' : ''} onClick={() => choose(linkMode ? v : '', 'soft')}>Soft copy</button>
+          </div>
+          <p className="hint">Soft copy: paste the drive link in this cell.</p>
+          {sel && <div className="pop-foot"><button className="link-btn" onClick={() => choose('')}>Clear</button></div>}
+        </div>
+      )}
+    </>
+  );
+}
+
+// Per-row autosave indicator.
+function SaveState({ st, onRetry }) {
+  if (!st) return null;
+  if (st.s === 'pending' || st.s === 'saving') return <span className="ss muted" role="status">Saving…</span>;
+  if (st.s === 'saved') return <span key={st.at} className="ss ok" role="status">✓ Saved</span>;
+  if (st.s === 'link') return <span className="ss warn" role="status">Drive link needed</span>;
+  return <button className="ss fail" onClick={onRetry} title={st.msg}>Failed — retry</button>;
+}
+
+// Programme header menu: set one column for every course in the programme (empty cells only, unless overwrite).
+function MarkAll({ g, cols, headers, onApply }) {
+  const p = usePop();
+  const [col, setCol] = useState(cols.yn[0]);
+  const [val, setVal] = useState('Y');
+  const [over, setOver] = useState(false);
+  const count = g.rows.filter(([r]) => over || !yn(r[col])).length;
+  const valName = { Y: 'Y (hard copy)', N: 'N', NA: 'NA' }[val];
+  const apply = () => {
+    const where = g.key || '(No programme)';
+    const what = over ? 'Existing entries will be overwritten.' : 'Only empty cells are filled.';
+    if (!confirm(`Set ${label(headers[col])} = ${valName} for ${count} course${count === 1 ? '' : 's'} in ${where}?\n${what}`)) return;
+    onApply(g, col, val, over);
+    p.close();
+  };
+  return (
+    <>
+      <button ref={p.anchor} className="btn-secondary btn-sm" onClick={p.toggle} aria-haspopup="dialog">Mark all…</button>
+      {p.pos && (
+        <div ref={p.pop} className="pop" style={p.pos} role="dialog" aria-label={`Mark all courses in ${g.key || 'this programme'}`}>
+          <div className="pop-title">Mark all courses in this programme</div>
+          <label className="field">Component
+            <select value={col} onChange={e => setCol(+e.target.value)}>
+              {cols.yn.map(j => <option key={j} value={j}>{label(headers[j])}</option>)}
+            </select>
+          </label>
+          <label className="field">Value
+            <select value={val} onChange={e => setVal(e.target.value)}>
+              <option value="Y">Y (hard copy)</option>
+              <option value="N">N</option>
+              <option value="NA">NA</option>
+            </select>
+          </label>
+          <label className="check"><input type="checkbox" checked={over} onChange={e => setOver(e.target.checked)} /> Overwrite existing entries</label>
+          <button className="btn-primary" disabled={!count} onClick={apply}>
+            Set {label(headers[col])} = {val} for {count} course{count === 1 ? '' : 's'}
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
+// Review status and actions, above the course list.
+//  Campus office: "Forward to director" appears only when every Y/N/NA cell is filled and all saves are done.
+//  Director: "Submit (no discrepancy)" or "Return for correction" (a note is required) once forwarded.
+const STATUS_LABEL = { draft: 'Not forwarded', forwarded: 'Awaiting director review', returned: 'Returned for correction', reopened: 'Reopened for editing', submitted: 'Submitted' };
+
+function WorkflowBar({ campus, mode, wf, emptyCount, allSaved, courses, onShowIncomplete, onDone }) {
+  const [busy, setBusy] = useState('');
+  const [returning, setReturning] = useState(false);
+  const [note, setNote] = useState('');
+  const [msg, setMsg] = useState(null); // { ok, text }
+  const { status, last } = wf;
+
+  async function act(action, body = {}) {
+    setBusy(action);
+    setMsg(null);
+    try {
+      const r = await api('workflow/' + action, { campus, ...body });
+      setMsg({ ok: true, text: { forwarded: 'Forwarded to the director.', submitted: 'Submitted. The CoE office has been notified.', returned: 'Returned to the campus office for correction.' }[r.status] + ' Email: ' + r.email });
+      setReturning(false);
+      setNote('');
+      onDone();
+    } catch (e) {
+      setMsg({ ok: false, text: e.message });
+    } finally {
+      setBusy('');
+    }
+  }
+
+  const who = last ? <> by <b>{last.by}</b> on <span className="tnum">{last.time}</span></> : null;
+  let text;
+  if (status === 'forwarded') {
+    text = mode === 'director'
+      ? <>Forwarded{who}. Check the entries below, then submit them or return them for correction.</>
+      : <>Forwarded to the director{who}. Entries are locked until the director submits or returns them.</>;
+  } else if (status === 'submitted') {
+    text = <>Submitted by the director{who}. The entries are final.</>;
+  } else if (status === 'returned') {
+    text = <>Returned for correction{who}.{mode === 'office' ? ' Please correct the entries and forward again.' : ''}</>;
+  } else if (status === 'reopened') {
+    text = <>Reopened for editing by the CoE office{who}.</>;
+  } else {
+    text = mode === 'director' ? <>The {campus} campus office has not forwarded the entries yet.</> : <>Not yet forwarded to the director.</>;
+  }
+
+  let actions = null;
+  if (mode === 'office' && !LOCKED.includes(status)) {
+    if (emptyCount > 0) {
+      actions = <>
+        <span className="wf-need"><b className="tnum">{emptyCount}</b> entr{emptyCount === 1 ? 'y is' : 'ies are'} still empty</span>
+        <button className="btn-secondary" onClick={onShowIncomplete}>Show courses with empty entries</button>
+      </>;
+    } else if (!allSaved) {
+      actions = <span className="muted">Saving your last changes…</span>;
+    } else {
+      actions = (
+        <button className="btn-primary" disabled={!!busy} onClick={() => {
+          if (confirm(`Forward the ${campus} entries (${courses} courses) to the director?\n\nThe entries will be locked until the director submits them or returns them for correction.`)) act('forward');
+        }}>{busy === 'forward' ? 'Forwarding…' : 'Forward to director'}</button>
+      );
+    }
+  } else if (mode === 'director' && status === 'forwarded' && !returning) {
+    actions = <>
+      <button className="btn-secondary" disabled={!!busy} onClick={() => setReturning(true)}>Return for correction</button>
+      <button className="btn-primary" disabled={!!busy} onClick={() => {
+        if (confirm(`Submit the ${campus} CIE entries?\n\nThis confirms there is no discrepancy. The entries become final and the CoE office is notified.`)) act('submit');
+      }}>{busy === 'submit' ? 'Submitting…' : 'Submit (no discrepancy)'}</button>
+    </>;
+  }
+
+  return (
+    <section className={'wf-bar wf-' + status} aria-label="Review status">
+      <div className="wf-main">
+        <div className="wf-status"><span className="wf-tag">{STATUS_LABEL[status] || status}</span><span>{text}</span></div>
+        {last?.note && (status === 'returned' || status === 'reopened') && <p className="wf-note"><b>Note:</b> {last.note}</p>}
+        {msg && <p className={msg.ok ? 'wf-msg' : 'wf-msg err'} role={msg.ok ? 'status' : 'alert'}>{msg.text}</p>}
+      </div>
+      {actions && <div className="wf-actions">{actions}</div>}
+      {returning && (
+        <div className="wf-return">
+          <label htmlFor="wf-note">What needs correcting? The campus office will receive this note by email.</label>
+          <textarea id="wf-note" rows={3} value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Block 2 for BPAM-301HV should be N, the scripts were not received." />
+          <div className="wf-actions">
+            <button className="btn-secondary" disabled={!!busy} onClick={() => { setReturning(false); setNote(''); }}>Cancel</button>
+            <button className="btn-primary" disabled={!!busy || !note.trim()} onClick={() => act('return', { note })}>{busy === 'return' ? 'Sending…' : 'Return to campus office'}</button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }

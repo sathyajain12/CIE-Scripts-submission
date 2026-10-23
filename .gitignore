@@ -2,3 +2,8 @@ node_modules
 dist
 .env
 .claude
+# Cloudflare: local secrets and dev state
+.dev.vars*
+.wrangler
+# Service account key files
+.secrets

@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // One Worker, one link (https://cie-scripts.<subdomain>.workers.dev). People sign in with Google;
+  // who sees which campus comes from the spreadsheet's "Users" tab (see worker/index.js).
+  // Deploy: npm run deploy
+  "name": "cie-scripts",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-10-21",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // /api/* goes to the Worker; everything else is the built site.
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "SHEET_ID": "1dYiYe6qJ8J8WKAoLhLfCsNAm0UvAAaxb6kwtw9BPguE",
+    // Campus tabs (also the role names used in the Users tab, alongside "Admin").
+    "CAMPUSES": "PSN,ATP,BRN,NDG",
+    "USERS_TAB": "Users",
+    // Review workflow record (created automatically on the first forward) and who hears about final submissions.
+    "WORKFLOW_TAB": "Workflow",
+    "COE_EMAIL": "coeoffice@sssihl.edu.in",
+    // OAuth 2.0 Client ID (Web application) from Google Cloud. Its "Authorised JavaScript origins" must list
+    // the portal's address (and http://localhost:5173 for local testing). A client ID is public by design.
+    "GOOGLE_CLIENT_ID": "445610922069-np1fa1ht442v9ctbr9tcdi5ei12pfpr1.apps.googleusercontent.com"
+  },
+  // Workers KV: keeps the Gmail connection (refresh token + sender) made once from the admin portal.
+  "kv_namespaces": [{ "binding": "STORE", "id": "05e2bc9ffb48403e89b0b042a8775d7c" }],
+  // Secrets (not in this file):
+  //   GOOGLE_CLIENT_SECRET = the OAuth client's secret (needed to send email through Gmail)
+  //   GOOGLE_SERVICE_ACCOUNT = the service account JSON key
+  //     Get-Content .secrets\service-account.json -Raw | npx wrangler secret put GOOGLE_SERVICE_ACCOUNT
+  //   SESSION_SECRET = a long random string that signs the session cookie (changing it signs everyone out)
+  // Local: .dev.vars (scripts/dev-vars.mjs) with SESSION_SECRET, plus DEV_EMAIL=<email> to stand in for the
+  // sign-in on localhost (leave DEV_EMAIL out to try the real Google button locally).
+  "observability": { "enabled": true }
+}
